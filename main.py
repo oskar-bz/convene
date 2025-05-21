@@ -1,5 +1,7 @@
 import toml
 import platform
+import os
+import sys
 
 # MYDOTS
 # Commands:
@@ -14,10 +16,19 @@ import platform
 #     stops tracking an application
 
 
+CONFIG_PATH
+
+def get_script_path():
+    return os.path.dirname(os.path.realpath(sys.argv[0]))
+
+def get_config():
+    with open(get_script_path() + "/config.toml")
+
 def main():
     # check for existing file
-    print("Hey")
-
+    config = get_config()
+        
+    save_config()
 
 if __name__ == "__main__":
     main()
