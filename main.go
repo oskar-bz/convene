@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -139,8 +141,51 @@ func print_usage() {
 	fmt.Println("\nTo get detailed Information, run `convene help [command]`.")
 }
 
+func CopyFile(src string, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(out, in)
+	if err != nil {
+		return err
+	}
+
+	return out.Close()
+}
+
+func CopyFileOrDir(src string, dst string) error {
+	sfi, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if sfi.Mode().IsRegular() { // if it is a file
+		dfi, err := os.Stat(src)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+		} else if os.SameFile(sfi, dfi) {
+			return nil // if they are the same file, don't bother copying
+		}
+		return CopyFile(src, dst)
+	} else if sfi.Mode().IsDir() {
+		// copy files in the dir recursively
+		fileCallback := func(path string, d DirEntry, err error) error {
+
+		}
+		filepath.WalkDir(src)
+	}
+}
+
 func cmd_add(args []string) {
-	fmt.Println("Add is not implemented yet!")
+
 }
 func cmd_rm(args []string) {
 	fmt.Println("Remove is not implemented yet!")
