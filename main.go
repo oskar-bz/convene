@@ -1,58 +1,35 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
-	"time"
 
 	"github.com/BurntSushi/toml"
 )
 
 type FileOrFolder struct {
-	path string
-	hash uint64
+	Hash [md5.Size]byte
 }
 
 // type Config map[string]string
 type Config struct {
-	repo_link  string
-	paths      []FileOrFolder
-	generation uint32
+	RepoLink   string
+	Paths      map[string]FileOrFolder
+	Generation uint32
 }
 
-/*
-	rr, err := command.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Split(bufio.ScanLines)
-	i := 0
-	lines := make([]string, 0, 10)
-	err = command.Start()
-	if err != nil {
-		return nil, err
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		lines = append(lines, line)
-		if callback != nil {
-			callback(line, i)
-		}
-		i += 1
-	}
-	command.Wait()
-	return lines, nil
-*/
-
 var CONFIG_PATH string
+var PATH_REPLACERS map[string]string
+var PATH_REPLACERS_SORTED []string
 
 func run_cmd(app string, args string) (string, error) {
 	command := exec.Command(app, strings.Split(args, " ")...)
@@ -61,7 +38,7 @@ func run_cmd(app string, args string) (string, error) {
 }
 
 func get_config() (Config, bool) {
-	content, err := os.ReadFile(CONFIG_PATH + "config.toml")
+	content, err := os.ReadFile(CONFIG_PATH + "config.Toml")
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// config file does not exist yet, show first time setup
@@ -70,31 +47,40 @@ func get_config() (Config, bool) {
 	}
 	var result Config
 	_, err = toml.Decode(string(content), &result)
+	_ = err
+
+	if result.Paths == nil {
+		result.Paths = make(map[string]FileOrFolder)
+	}
 	return result, false
 }
 
-func save_config(config Config) {
-	file, err := os.Create(CONFIG_PATH + "config.toml")
+func save_config(config *Config) {
+	file, err := os.Create(CONFIG_PATH + "config.Toml")
 	if err != nil {
 		panic(err)
 	}
-	buf := new(bytes.Buffer)
+
 	encoder := toml.NewEncoder(file)
-	err = encoder.Encode(config)
+	err = encoder.Encode(&config)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(buf.String())
-	file.Close()
+
+	err = file.Close()
+	if err != nil {
+		panic(err)
+	}
 }
 
-func show_loading(_ string, i int) {
+func show_loading(i int) {
 	indicators := [...]string{"|", "/", "-", "\\"}
+	i /= 4
 	fmt.Print("\rLoading " + indicators[i%4])
 }
 
-func onboarding(config Config) {
-	for true {
+func onboarding(config *Config) {
+	for {
 		fmt.Println("To start syncing your files, you first need to create a git repository. When you're done, paste the link here:")
 		var link string
 		fmt.Scanln(&link)
@@ -124,7 +110,7 @@ func onboarding(config Config) {
 		}
 
 		// save the repo link
-		config.repo_link = link
+		config.RepoLink = link
 		break
 	}
 	fmt.Println("Done! You can now start adding files to track with `convene add <file/folder>` ")
@@ -132,7 +118,7 @@ func onboarding(config Config) {
 
 func print_usage() {
 	fmt.Println("Convene - tame and synchronize your scattered files with ease")
-	fmt.Println("\nUsage:    convene [command] <args>")
+	fmt.Println("\nUsage: convene [command] <args>")
 	fmt.Println("\nThese are the available commands:")
 	fmt.Println("    add [folder | file]   adds a folder/file to be synced")
 	fmt.Println("    rm [folder | file]    stops tracking a folder/file")
@@ -160,6 +146,23 @@ func CopyFile(src string, dst string) error {
 	return out.Close()
 }
 
+func SplitFileFromPath(path string) (string, string) {
+	split_at := 0
+	for i := len(path) - 1; i > 0; i-- {
+		c := path[i]
+		if c == '/' || c == '\\' {
+			split_at = i
+			break
+		}
+	}
+	return path[:split_at+1], path[split_at+1:]
+}
+
+func MovePath(src string, dst string, base string) string {
+	rel_path := strings.Replace(src, base, "", 1)
+	return dst + rel_path
+}
+
 func CopyFileOrDir(src string, dst string) error {
 	sfi, err := os.Stat(src)
 	if err != nil {
@@ -177,20 +180,162 @@ func CopyFileOrDir(src string, dst string) error {
 		return CopyFile(src, dst)
 	} else if sfi.Mode().IsDir() {
 		// copy files in the dir recursively
-		fileCallback := func(path string, d DirEntry, err error) error {
-
+		fileCallback := func(path string, d fs.DirEntry, err error) error {
+			if !d.Type().IsRegular() {
+				return nil
+			}
+			new_path := MovePath(path, dst, src)
+			CopyFile(path, new_path)
+			return nil
 		}
-		filepath.WalkDir(src)
+		err := filepath.WalkDir(src, fileCallback)
+		return err
+	}
+	return nil
+}
+
+func HashFile(path string) ([md5.Size]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return [md5.Size]byte{}, err
+	}
+	defer file.Close()
+
+	// Get the file size
+	stat, err := file.Stat()
+	if err != nil {
+		return [16]byte{}, err
+	}
+	// Read the file into a byte slice
+	bs := make([]byte, stat.Size())
+	_, err = bufio.NewReader(file).Read(bs)
+	if err != nil && err != io.EOF {
+		return [16]byte{}, err
+	}
+
+	return md5.Sum(bs), nil
+}
+
+func HashPath(path string) ([md5.Size]byte, error) {
+	s, err := os.Stat(path)
+	if err != nil {
+		return [md5.Size]byte{}, err
+	}
+
+	if s.Mode().IsRegular() {
+		// if it is a file
+		return HashFile(path)
+	}
+	// if it is a directory
+	hashes := make([]byte, 0, 16*10)
+	i := 0
+	callback := func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if strings.Contains(path, "/.") || strings.Contains(path, "\\.") {
+			return nil
+		}
+
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		h, err := HashFile(path)
+		if err != nil {
+			fmt.Printf("Failed to Add file %s (%s)\n", path, err.Error())
+			return nil
+		}
+		//dots := [3]string{".", "..", "..."}
+		fmt.Printf("\rLoading %d", i)
+		//show_loading(i)
+		i += 1
+		for j := range md5.Size {
+			hashes = append(hashes, h[j])
+		}
+		return nil
+	}
+	err = filepath.WalkDir(path, callback)
+
+	return md5.Sum(hashes), err
+}
+
+func NormalizePath(path string) string {
+	path = strings.ToLower(path)
+	path = strings.Replace(path, NOT_SEPERATOR, SEPERATOR, -1)
+
+	fmt.Println("hey", PATH_REPLACERS_SORTED)
+	for _, key := range PATH_REPLACERS_SORTED {
+		value := PATH_REPLACERS[key]
+		fmt.Println("Trying", key, "=>", value, "in:", path)
+		path = strings.Replace(path, key, value, 1)
+	}
+	return path
+}
+
+func cmd_add(config *Config, args []string) {
+	if len(args) == 0 {
+		fmt.Println("Nothing to add.")
+		return
+	}
+
+	for _, arg := range args {
+		// check if path is already in tracked paths
+		found := false
+		for key, _ := range config.Paths {
+			if strings.Contains(arg, key) {
+				found = true
+			}
+		}
+		if found {
+			fmt.Printf("'%s' is already tracked\n", arg)
+			continue
+		}
+
+		// normalize path
+		normalized := NormalizePath(arg)
+
+		fmt.Println(arg, "=>", normalized)
+		continue
+		_, err := os.Stat(normalized)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Printf("Error: Could not add '%s', because it does not exist\n", normalized)
+			} else {
+				fmt.Printf("Error: Could not add '%s' (%s)\n", normalized, err.Error())
+			}
+			continue
+		}
+		h, err := HashPath(normalized)
+		if err != nil {
+			fmt.Printf("Error: Could not add '%s' (%s)\n", normalized, err.Error())
+			continue
+		}
+		fmt.Printf("\rAdded '%s'\n", normalized)
+		config.Paths[normalized] = FileOrFolder{Hash: h}
 	}
 }
 
-func cmd_add(args []string) {
+func cmd_rm(config *Config, args []string) {
+	if len(args) == 0 {
+		fmt.Println("Nothing to remove.")
+		return
+	}
+	for _, arg := range args {
+		delete(config.Paths, arg)
+		fmt.Println("Removed", arg)
+	}
+}
 
+func cmd_list(config *Config) {
+	fmt.Println("Tracked Paths:")
+	for key, _ := range config.Paths {
+		fmt.Println("-", key)
+	}
 }
-func cmd_rm(args []string) {
-	fmt.Println("Remove is not implemented yet!")
-}
-func cmd_sync(args []string) {
+
+func cmd_sync(config *Config, args []string) {
 	fmt.Println("Sync is not implemented yet!")
 }
 
@@ -217,31 +362,63 @@ func cmd_help(args []string) {
 
 func main() {
 	CONFIG_PATH = get_configpath()
+	PATH_REPLACERS = GetPathReplacers()
+	// get keys
+	PATH_REPLACERS_SORTED = make([]string, len(PATH_REPLACERS))
+	i := 0
+	for k := range PATH_REPLACERS {
+		PATH_REPLACERS_SORTED[i] = k
+		i += 1
+	}
+	// sort keys by length in descending order
+	slices.SortFunc(PATH_REPLACERS_SORTED, func(a string, b string) int {
+		if len(a) > len(b) {
+			return -1
+		} else if len(a) == len(b) {
+			return 0
+		} else {
+			return 1
+		}
+	})
+
+	fmt.Println(PATH_REPLACERS_SORTED)
 	config, show_intro := get_config()
+	defer save_config(&config)
+
 	// checking git version
 	git_version, err := run_cmd("git", "--version")
 	if err != nil {
 		fmt.Println("Convene uses *git* to synchronize your files. Please make sure it is installed and on your PATH.")
 		return
 	}
-	if show_intro || config.repo_link == "" {
-		fmt.Println("# Welcome to Convene!")
-		onboarding(config)
-	}
+	fmt.Println("# Welcome to Convene!")
+
 	fmt.Println("- Using", git_version)
+	if show_intro || config.RepoLink == "" {
+		onboarding(&config)
+	}
+
+	if len(os.Args) == 1 {
+		print_usage()
+		return
+	}
 
 	switch os.Args[1] {
 	case "add":
 		{
-			cmd_add(os.Args[2:])
+			cmd_add(&config, os.Args[2:])
 		}
 	case "rm":
 		{
-			cmd_rm(os.Args[2:])
+			cmd_rm(&config, os.Args[2:])
+		}
+	case "list":
+		{
+			cmd_list(&config)
 		}
 	case "sync":
 		{
-			cmd_sync(os.Args[2:])
+			cmd_sync(&config, os.Args[2:])
 		}
 	case "help":
 		{
@@ -253,6 +430,4 @@ func main() {
 			print_usage()
 		}
 	}
-
-	save_config(config)
 }
