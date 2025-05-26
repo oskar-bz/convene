@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -20,11 +21,11 @@ type FileOrFolder struct {
 	Hash [md5.Size]byte
 }
 
-// type Config map[string]string
 type Config struct {
-	RepoLink   string
-	Paths      map[string]FileOrFolder
-	Generation uint32
+	RepoLink    string
+	Paths       map[string]FileOrFolder
+	SyncedPaths map[string]string
+	Generation  uint32
 }
 
 var CONFIG_PATH string
@@ -33,6 +34,13 @@ var PATH_REPLACERS_SORTED []string
 
 func run_cmd(app string, args string) (string, error) {
 	command := exec.Command(app, strings.Split(args, " ")...)
+	output, err := command.CombinedOutput()
+	return string(output), err
+}
+
+func run_cmd_in(app string, args string, wd string) (string, error) {
+	command := exec.Command(app, strings.Split(args, " ")...)
+	command.Dir = CONFIG_PATH
 	output, err := command.CombinedOutput()
 	return string(output), err
 }
@@ -265,11 +273,14 @@ func NormalizePath(path string) string {
 	path = strings.ToLower(path)
 	path = strings.Replace(path, NOT_SEPERATOR, SEPERATOR, -1)
 
-	fmt.Println("hey", PATH_REPLACERS_SORTED)
+	//fmt.Println("hey", PATH_REPLACERS_SORTED)
 	for _, key := range PATH_REPLACERS_SORTED {
 		value := PATH_REPLACERS[key]
-		fmt.Println("Trying", key, "=>", value, "in:", path)
+		//fmt.Println("Trying", key, "=>", value, "in:", path)
 		path = strings.Replace(path, key, value, 1)
+	}
+	if path[len(path)-1] == SEPERATOR[0] {
+		path = path[:len(path)-1]
 	}
 	return path
 }
@@ -282,6 +293,11 @@ func cmd_add(config *Config, args []string) {
 
 	for _, arg := range args {
 		// check if path is already in tracked paths
+		arg, err := filepath.Abs(arg)
+		if err != nil {
+			fmt.Printf("Error: Could not add '%s' (%s)", arg, err.Error())
+			continue
+		}
 		found := false
 		for key, _ := range config.Paths {
 			if strings.Contains(arg, key) {
@@ -295,21 +311,18 @@ func cmd_add(config *Config, args []string) {
 
 		// normalize path
 		normalized := NormalizePath(arg)
-
-		fmt.Println(arg, "=>", normalized)
-		continue
-		_, err := os.Stat(normalized)
+		_, err = os.Stat(arg)
 		if err != nil {
 			if os.IsNotExist(err) {
-				fmt.Printf("Error: Could not add '%s', because it does not exist\n", normalized)
+				fmt.Printf("Error: Could not add '%s', because it does not exist\n", arg)
 			} else {
-				fmt.Printf("Error: Could not add '%s' (%s)\n", normalized, err.Error())
+				fmt.Printf("Error: Could not add '%s' (%s)\n", arg, err.Error())
 			}
 			continue
 		}
-		h, err := HashPath(normalized)
+		h, err := HashPath(arg)
 		if err != nil {
-			fmt.Printf("Error: Could not add '%s' (%s)\n", normalized, err.Error())
+			fmt.Printf("Error: Could not add '%s' (%s)\n", arg, err.Error())
 			continue
 		}
 		fmt.Printf("\rAdded '%s'\n", normalized)
@@ -323,6 +336,17 @@ func cmd_rm(config *Config, args []string) {
 		return
 	}
 	for _, arg := range args {
+		arg, err := filepath.Abs(arg)
+		if err != nil {
+			fmt.Printf("Error: Could not remove '%s' (%s)", arg, err.Error())
+			continue
+		}
+		arg = NormalizePath(arg)
+		_, ok := config.Paths[arg]
+		if !ok {
+			fmt.Println("Error: Could not remove", arg, "because it was not tracked")
+			continue
+		}
 		delete(config.Paths, arg)
 		fmt.Println("Removed", arg)
 	}
@@ -336,7 +360,40 @@ func cmd_list(config *Config) {
 }
 
 func cmd_sync(config *Config, args []string) {
-	fmt.Println("Sync is not implemented yet!")
+	// run git pull
+	out, err := run_cmd_in("git", "pull", CONFIG_PATH)
+	if err != nil {
+		fmt.Printf("Failed to sync: %s\n", err.Error())
+		return
+	}
+	if strings.Contains(out, "up to date") {
+		// if there were no upstream changes
+		i := 0
+		for key, _ := range config.Paths {
+			end, front := SplitFileFromPath(key)
+			config.SyncedPaths[end] = front
+			CopyFileOrDir(key, CONFIG_PATH+end+SEPERATOR)
+			fmt.Println("Loading", i)
+			i += 1
+		}
+		output, err := run_cmd_in("git", "commit -m '"+time.Now().Local().Format(time.RFC1123), "'")
+		if err != nil {
+			fmt.Printf("Error: Failed to commit data (%s)", err.Error())
+		}
+		return
+	}
+	changed := false
+	for key, value := range config.Paths {
+		h, err := HashPath(key)
+		if err != nil {
+			fmt.Printf("Failed to sync: %s\n", err.Error())
+			return
+		}
+		if h != value.Hash {
+			changed = true
+		}
+	}
+	_ = changed
 }
 
 func cmd_help(args []string) {
@@ -381,7 +438,6 @@ func main() {
 		}
 	})
 
-	fmt.Println(PATH_REPLACERS_SORTED)
 	config, show_intro := get_config()
 	defer save_config(&config)
 

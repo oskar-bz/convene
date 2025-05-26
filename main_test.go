@@ -1,6 +1,7 @@
 package main
 
 import "testing"
+import "time"
 
 func TestSplitFileFromPath(t *testing.T) {
 	path := "C:\\users\\ossel\\downloads\\moin.abc"
@@ -30,4 +31,8 @@ func TestMovePath(t *testing.T) {
 	if got != "new/directory/my/file.exe" {
 		t.Errorf("MovePath, got %s", got)
 	}
+}
+
+func TestTimeToString(t *testing.T) {
+	t.Errorf("%s", time.Now().Local().Format(time.RFC1123))
 }
