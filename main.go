@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -38,8 +39,8 @@ func run_cmd(app string, args string) (string, error) {
 	return string(output), err
 }
 
-func run_cmd_in(app string, args string, wd string) (string, error) {
-	command := exec.Command(app, strings.Split(args, " ")...)
+func run_cmd_in(app string, wd string, args ...string) (string, error) {
+	command := exec.Command(app, args...)
 	command.Dir = CONFIG_PATH
 	output, err := command.CombinedOutput()
 	return string(output), err
@@ -59,6 +60,9 @@ func get_config() (Config, bool) {
 
 	if result.Paths == nil {
 		result.Paths = make(map[string]FileOrFolder)
+	}
+	if result.SyncedPaths == nil {
+		result.SyncedPaths = make(map[string]string)
 	}
 	return result, false
 }
@@ -91,6 +95,7 @@ func onboarding(config *Config) {
 	for {
 		fmt.Println("To start syncing your files, you first need to create a git repository. When you're done, paste the link here:")
 		var link string
+		//link = "https://github.com/oskar-bz/syncme.git"
 		fmt.Scanln(&link)
 
 		// test the repo link
@@ -117,6 +122,39 @@ func onboarding(config *Config) {
 			}
 		}
 
+		// create dummy file
+		file, err := os.Create(CONFIG_PATH + "config.Toml")
+		if err != nil {
+			fmt.Println("Failed to create the Config File:", err.Error())
+			return
+		}
+		file.WriteString("testing = \"true\"\n")
+		file.Close()
+
+		out, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
+		if err != nil {
+			fmt.Println("Failed to add files to git commit", err.Error())
+			return
+		}
+
+		out, err = run_cmd_in("git", CONFIG_PATH, "commit", "-m", "initial commit")
+		if err != nil {
+			fmt.Println("Failed to create initial commit:", err.Error(), "\n", out)
+			return
+		}
+
+		out, err = run_cmd_in("git", CONFIG_PATH, "push", "-u")
+		if err != nil {
+			fmt.Println("Failed to sync with upstream repository:", err.Error())
+			return
+		}
+
+		out, err = run_cmd_in("git", CONFIG_PATH, "pull")
+		if err != nil {
+			fmt.Println("Failed to pull from upstream repository:", err.Error())
+			return
+		}
+
 		// save the repo link
 		config.RepoLink = link
 		break
@@ -141,6 +179,12 @@ func CopyFile(src string, dst string) error {
 		return err
 	}
 	defer in.Close()
+	// make sure the folder already exists
+	dst_dir, _ := SplitFileFromPath(dst)
+	err = os.MkdirAll(dst_dir, 0o666)
+	if err != nil {
+		return err
+	}
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
@@ -151,6 +195,7 @@ func CopyFile(src string, dst string) error {
 		return err
 	}
 
+	fmt.Println("Successfully copied", src, "to", dst)
 	return out.Close()
 }
 
@@ -168,6 +213,9 @@ func SplitFileFromPath(path string) (string, string) {
 
 func MovePath(src string, dst string, base string) string {
 	rel_path := strings.Replace(src, base, "", 1)
+	if dst[len(dst)-1] == SEPERATOR[0] && rel_path[0] == SEPERATOR[0] {
+		dst = dst[:len(dst)-1]
+	}
 	return dst + rel_path
 }
 
@@ -189,12 +237,14 @@ func CopyFileOrDir(src string, dst string) error {
 	} else if sfi.Mode().IsDir() {
 		// copy files in the dir recursively
 		fileCallback := func(path string, d fs.DirEntry, err error) error {
+			fmt.Println("Encountered", path)
 			if !d.Type().IsRegular() {
 				return nil
 			}
 			new_path := MovePath(path, dst, src)
-			CopyFile(path, new_path)
-			return nil
+			fmt.Println(path, "=>", new_path)
+			err = CopyFile(path, new_path)
+			return err
 		}
 		err := filepath.WalkDir(src, fileCallback)
 		return err
@@ -359,41 +409,82 @@ func cmd_list(config *Config) {
 	}
 }
 
+func ExpandEnvVars(path string) string {
+	regex := `\%([a-zA-Z0-9_]+)\%`
+	replacement := `${$1}`
+	re := regexp.MustCompile(regex)
+	result := re.ReplaceAllString(path, replacement)
+	return os.ExpandEnv(result)
+}
+
 func cmd_sync(config *Config, args []string) {
 	// run git pull
-	out, err := run_cmd_in("git", "pull", CONFIG_PATH)
+	out, err := run_cmd_in("git", CONFIG_PATH, "pull")
 	if err != nil {
+		fmt.Printf("%s\n", out)
 		fmt.Printf("Failed to sync: %s\n", err.Error())
 		return
 	}
 	if strings.Contains(out, "up to date") {
 		// if there were no upstream changes
+		fmt.Println("No upstream changes, copying")
 		i := 0
 		for key, _ := range config.Paths {
-			end, front := SplitFileFromPath(key)
-			config.SyncedPaths[end] = front
-			CopyFileOrDir(key, CONFIG_PATH+end+SEPERATOR)
-			fmt.Println("Loading", i)
+			fmt.Println("copying 1")
+			p := ExpandEnvVars(key)
+			_, front := SplitFileFromPath(p)
+			config.SyncedPaths[front] = key
+			err = CopyFileOrDir(p, CONFIG_PATH+front+SEPERATOR)
+			if err != nil {
+				fmt.Println("Failed to copy necessary files:", err.Error())
+				return
+			}
+			fmt.Println("Copied", p, "to", CONFIG_PATH+front+SEPERATOR)
 			i += 1
 		}
-		output, err := run_cmd_in("git", "commit -m '"+time.Now().Local().Format(time.RFC1123), "'")
+		config.Generation += 1
+		save_config(config)
+		fmt.Println("saved config")
+
+		fmt.Print("Loading.")
+		_, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
+		if err != nil {
+			fmt.Println("Error: Failed to add files to git commit:", err.Error())
+			return
+		}
+
+		fmt.Print("\rLoading..")
+
+		_, err = run_cmd_in("git", CONFIG_PATH, "commit", "-m", "\""+time.Now().Local().Format(time.RFC1123)+"\"")
 		if err != nil {
 			fmt.Printf("Error: Failed to commit data (%s)", err.Error())
+			return
+		}
+
+		fmt.Print("\rLoading...")
+
+		_, err = run_cmd_in("git", CONFIG_PATH, "push", "-u")
+		if err != nil {
+			fmt.Printf("Error: Failed to push changes (%s)", err.Error())
+			return
 		}
 		return
 	}
-	changed := false
-	for key, value := range config.Paths {
-		h, err := HashPath(key)
-		if err != nil {
-			fmt.Printf("Failed to sync: %s\n", err.Error())
-			return
+	// TODO: upstream is newer
+	/*
+		changed := false
+		for key, value := range config.Paths {
+			h, err := HashPath(key)
+			if err != nil {
+				fmt.Printf("Failed to sync: %s\n", err.Error())
+				return
+			}
+			if h != value.Hash {
+				changed = true
+			}
 		}
-		if h != value.Hash {
-			changed = true
-		}
-	}
-	_ = changed
+		_ = changed
+	*/
 }
 
 func cmd_help(args []string) {
@@ -452,6 +543,10 @@ func main() {
 	fmt.Println("- Using", git_version)
 	if show_intro || config.RepoLink == "" {
 		onboarding(&config)
+	}
+
+	if show_intro {
+		return
 	}
 
 	if len(os.Args) == 1 {
