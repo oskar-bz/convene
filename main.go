@@ -133,7 +133,7 @@ func onboarding(config *Config) {
 
 		out, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
 		if err != nil {
-			fmt.Println("Failed to add files to git commit", err.Error())
+			fmt.Println("Failed to add files to git commit", err.Error(), "(", out, ")")
 			return
 		}
 
@@ -237,12 +237,12 @@ func CopyFileOrDir(src string, dst string) error {
 	} else if sfi.Mode().IsDir() {
 		// copy files in the dir recursively
 		fileCallback := func(path string, d fs.DirEntry, err error) error {
-			fmt.Println("Encountered", path)
+			//fmt.Println("Encountered", path)
 			if !d.Type().IsRegular() {
 				return nil
 			}
 			new_path := MovePath(path, dst, src)
-			fmt.Println(path, "=>", new_path)
+			//fmt.Println(path, "=>", new_path)
 			err = CopyFile(path, new_path)
 			return err
 		}
@@ -417,6 +417,29 @@ func ExpandEnvVars(path string) string {
 	return os.ExpandEnv(result)
 }
 
+func sync_from_remote(config *Config) {
+	out, err := run_cmd_in("git", CONFIG_PATH, "pull")
+	if err != nil {
+		fmt.Println("Failed to pull files from repository:", err.Error(), "\n\"", out, "\"")
+		return
+	}
+
+	for key, value := range config.SyncedPaths {
+		target_path := ExpandEnvVars(value)
+		err := CopyFileOrDir(CONFIG_PATH+key, target_path)
+		if err != nil {
+			fmt.Printf("Failed to copy %s to %s: %s\n", CONFIG_PATH+key, target_path, err.Error())
+			return
+		}
+		fmt.Printf("Copied %s to %s\n", CONFIG_PATH+key, target_path)
+	}
+	fmt.Println("Finished syncing.")
+}
+
+func sync_from_local(config *Config) {
+	fmt.Println("Syncing from local is not implemented yet")
+}
+
 func cmd_sync(config *Config, args []string) {
 	// run git pull
 	out, err := run_cmd_in("git", CONFIG_PATH, "pull")
@@ -429,8 +452,12 @@ func cmd_sync(config *Config, args []string) {
 		// if there were no upstream changes
 		fmt.Println("No upstream changes, copying")
 		i := 0
+		// remove all old files in dir
+		for key, _ := range config.SyncedPaths {
+			os.RemoveAll(CONFIG_PATH + key)
+		}
+		// copy new files
 		for key, _ := range config.Paths {
-			fmt.Println("copying 1")
 			p := ExpandEnvVars(key)
 			_, front := SplitFileFromPath(p)
 			config.SyncedPaths[front] = key
@@ -439,17 +466,18 @@ func cmd_sync(config *Config, args []string) {
 				fmt.Println("Failed to copy necessary files:", err.Error())
 				return
 			}
-			fmt.Println("Copied", p, "to", CONFIG_PATH+front+SEPERATOR)
+			fmt.Println("\rCopying", i)
 			i += 1
 		}
+		os.MkdirAll(CONFIG_PATH, 0o666)
 		config.Generation += 1
 		save_config(config)
 		fmt.Println("saved config")
 
 		fmt.Print("Loading.")
-		_, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
+		out, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
 		if err != nil {
-			fmt.Println("Error: Failed to add files to git commit:", err.Error())
+			fmt.Println("Error: Failed to add files to git commit:", err.Error(), "(", out, ")")
 			return
 		}
 
@@ -470,21 +498,44 @@ func cmd_sync(config *Config, args []string) {
 		}
 		return
 	}
-	// TODO: upstream is newer
-	/*
-		changed := false
-		for key, value := range config.Paths {
-			h, err := HashPath(key)
-			if err != nil {
-				fmt.Printf("Failed to sync: %s\n", err.Error())
+	// upstream is newer
+
+	// check if files changed locally
+	changed := make([]string, 0, 5)
+	for key, value := range config.Paths {
+		h, err := HashPath(key)
+		if err != nil {
+			fmt.Printf("Failed to sync: %s\n", err.Error())
+			return
+		}
+		if h != value.Hash {
+			changed = append(changed, key)
+		}
+	}
+	if len(changed) > 0 {
+		fmt.Println("Conflict while syncing. Changes were made both to the remote and the local files.")
+		for c := range changed {
+			fmt.Println("Changed:", c)
+		}
+		valid := false
+		for valid {
+			fmt.Print("Keep 'remote' or 'local' files, or 'cancel': ")
+			choice := ""
+			fmt.Scanln(&choice)
+			if choice == "remote" {
+				valid = true
+				sync_from_remote(config)
 				return
-			}
-			if h != value.Hash {
-				changed = true
+			} else if choice == "local" {
+				valid = true
+				sync_from_local(config)
+				return
+			} else {
+
 			}
 		}
-		_ = changed
-	*/
+
+	}
 }
 
 func cmd_help(args []string) {
