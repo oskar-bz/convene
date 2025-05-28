@@ -100,7 +100,7 @@ func onboarding(config *Config) {
 
 		// test the repo link
 		fmt.Println("Loading...")
-		output, err := run_cmd("git", "clone --progress "+link+" "+CONFIG_PATH)
+		output, err := run_cmd("git", "clone "+link+" "+CONFIG_PATH)
 		_, ok := err.(*exec.ExitError)
 		// if it is not an exit error
 		if !ok && err != nil {
@@ -119,6 +119,18 @@ func onboarding(config *Config) {
 			} else {
 				// if it is not an exit error
 				continue
+			}
+		}
+
+		// check if repository already contained a config file
+		_, err = os.Stat(CONFIG_PATH + "config.toml")
+		if err == nil {
+			// config file already exists
+			new_config, show_onboarding := get_config()
+			if !show_onboarding {
+				fmt.Println("Loaded already existing config. You can now start adding files to track using `convene add <file/folder>`")
+				*config = new_config
+				return
 			}
 		}
 
@@ -418,12 +430,7 @@ func ExpandEnvVars(path string) string {
 }
 
 func sync_from_remote(config *Config) {
-	out, err := run_cmd_in("git", CONFIG_PATH, "pull")
-	if err != nil {
-		fmt.Println("Failed to pull files from repository:", err.Error(), "\n\"", out, "\"")
-		return
-	}
-
+	// already pulled, only thing left is copying files to their places
 	for key, value := range config.SyncedPaths {
 		target_path := ExpandEnvVars(value)
 		err := CopyFileOrDir(CONFIG_PATH+key, target_path)
@@ -441,6 +448,20 @@ func sync_from_local(config *Config) {
 }
 
 func cmd_sync(config *Config, args []string) {
+	// check if files changed locally
+	changed := make([]string, 0, 5)
+	for key, value := range config.Paths {
+		p := ExpandEnvVars(key)
+		h, err := HashPath(p)
+		if err != nil {
+			fmt.Printf("Failed to sync: %s\n", err.Error())
+			return
+		}
+		if h != value.Hash {
+			changed = append(changed, key)
+		}
+	}
+
 	// run git pull
 	out, err := run_cmd_in("git", CONFIG_PATH, "pull")
 	if err != nil {
@@ -450,13 +471,19 @@ func cmd_sync(config *Config, args []string) {
 	}
 	if strings.Contains(out, "up to date") {
 		// if there were no upstream changes
-		fmt.Println("No upstream changes, copying")
-		i := 0
+		fmt.Println("No upstream changes")
+		if len(changed) == 0 {
+			// CASE 1: Neither local nor remote changes
+			fmt.Println("No local changes. Nothing to sync, exiting..")
+			return
+		}
+		// CASE 2: only local changes
 		// remove all old files in dir
 		for key, _ := range config.SyncedPaths {
 			os.RemoveAll(CONFIG_PATH + key)
 		}
 		// copy new files
+		i := 0
 		for key, _ := range config.Paths {
 			p := ExpandEnvVars(key)
 			_, front := SplitFileFromPath(p)
@@ -466,7 +493,7 @@ func cmd_sync(config *Config, args []string) {
 				fmt.Println("Failed to copy necessary files:", err.Error())
 				return
 			}
-			fmt.Println("\rCopying", i)
+			//fmt.Println("\rCopying", i)
 			i += 1
 		}
 		os.MkdirAll(CONFIG_PATH, 0o666)
@@ -498,21 +525,13 @@ func cmd_sync(config *Config, args []string) {
 		}
 		return
 	}
-	// upstream is newer
 
-	// check if files changed locally
-	changed := make([]string, 0, 5)
-	for key, value := range config.Paths {
-		h, err := HashPath(key)
-		if err != nil {
-			fmt.Printf("Failed to sync: %s\n", err.Error())
-			return
-		}
-		if h != value.Hash {
-			changed = append(changed, key)
-		}
-	}
-	if len(changed) > 0 {
+	if len(changed) == 0 {
+		// CASE 3: Only remote changes
+		sync_from_remote(config)
+		return
+	} else {
+		// CASE 4: Both local and remote changes
 		fmt.Println("Conflict while syncing. Changes were made both to the remote and the local files.")
 		for c := range changed {
 			fmt.Println("Changed:", c)
@@ -530,11 +549,12 @@ func cmd_sync(config *Config, args []string) {
 				valid = true
 				sync_from_local(config)
 				return
-			} else {
-
+			} else if choice == "cancel" {
+				valid = true
+				fmt.Println("Canceling.")
+				return
 			}
 		}
-
 	}
 }
 
