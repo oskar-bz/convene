@@ -444,7 +444,51 @@ func sync_from_remote(config *Config) {
 }
 
 func sync_from_local(config *Config) {
-	fmt.Println("Syncing from local is not implemented yet")
+	// remove all old files in dir
+	for key, _ := range config.SyncedPaths {
+		os.RemoveAll(CONFIG_PATH + key)
+	}
+	// copy new files
+	i := 0
+	for key, _ := range config.Paths {
+		p := ExpandEnvVars(key)
+		_, front := SplitFileFromPath(p)
+		config.SyncedPaths[front] = key
+		err := CopyFileOrDir(p, CONFIG_PATH+front+SEPERATOR)
+		if err != nil {
+			fmt.Println("Failed to copy necessary files:", err.Error())
+			return
+		}
+		//fmt.Println("\rCopying", i)
+		i += 1
+	}
+	os.MkdirAll(CONFIG_PATH, 0o666)
+	config.Generation += 1
+	save_config(config)
+	fmt.Println("saved config")
+
+	fmt.Print("Loading.")
+	out, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
+	if err != nil {
+		fmt.Println("Error: Failed to add files to git commit:", err.Error(), "(", out, ")")
+		return
+	}
+
+	fmt.Print("\rLoading..")
+
+	_, err = run_cmd_in("git", CONFIG_PATH, "commit", "-m", "\""+time.Now().Local().Format(time.RFC1123)+"\"")
+	if err != nil {
+		fmt.Printf("Error: Failed to commit data (%s)", err.Error())
+		return
+	}
+
+	fmt.Print("\rLoading...")
+
+	_, err = run_cmd_in("git", CONFIG_PATH, "push", "-u")
+	if err != nil {
+		fmt.Printf("Error: Failed to push changes (%s)", err.Error())
+		return
+	}
 }
 
 func cmd_sync(config *Config, args []string) {
@@ -478,51 +522,7 @@ func cmd_sync(config *Config, args []string) {
 			return
 		}
 		// CASE 2: only local changes
-		// remove all old files in dir
-		for key, _ := range config.SyncedPaths {
-			os.RemoveAll(CONFIG_PATH + key)
-		}
-		// copy new files
-		i := 0
-		for key, _ := range config.Paths {
-			p := ExpandEnvVars(key)
-			_, front := SplitFileFromPath(p)
-			config.SyncedPaths[front] = key
-			err = CopyFileOrDir(p, CONFIG_PATH+front+SEPERATOR)
-			if err != nil {
-				fmt.Println("Failed to copy necessary files:", err.Error())
-				return
-			}
-			//fmt.Println("\rCopying", i)
-			i += 1
-		}
-		os.MkdirAll(CONFIG_PATH, 0o666)
-		config.Generation += 1
-		save_config(config)
-		fmt.Println("saved config")
-
-		fmt.Print("Loading.")
-		out, err := run_cmd_in("git", CONFIG_PATH, "add", "*")
-		if err != nil {
-			fmt.Println("Error: Failed to add files to git commit:", err.Error(), "(", out, ")")
-			return
-		}
-
-		fmt.Print("\rLoading..")
-
-		_, err = run_cmd_in("git", CONFIG_PATH, "commit", "-m", "\""+time.Now().Local().Format(time.RFC1123)+"\"")
-		if err != nil {
-			fmt.Printf("Error: Failed to commit data (%s)", err.Error())
-			return
-		}
-
-		fmt.Print("\rLoading...")
-
-		_, err = run_cmd_in("git", CONFIG_PATH, "push", "-u")
-		if err != nil {
-			fmt.Printf("Error: Failed to push changes (%s)", err.Error())
-			return
-		}
+		sync_from_local(config)
 		return
 	}
 
